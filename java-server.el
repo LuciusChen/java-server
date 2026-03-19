@@ -15,15 +15,12 @@
 ;;   * Tomcat WAR build-and-deploy with mode-line status
 ;;   * Spring Boot JAR build-and-run with mode-line status
 ;;   * Optional dape integration (auto-attach on debug start)
-;;   * MyBatis mapper <-> XML navigation
-;;   * .class file decompilation via FernFlower
 ;;
 ;;; Code:
 
 (require 'cl-lib)
 (require 'seq)
 (require 'project)
-(require 'xref)
 
 (declare-function eglot-current-server "eglot")
 (declare-function eglot-execute-command "eglot")
@@ -765,55 +762,6 @@ Mode-line indicators for Tomcat and Spring Boot are managed automatically
 and do not require this mode to be active."
   :lighter " JSrv"
   :keymap java-server-mode-map)
-
-;;; ============================================================
-;;; Module 8: Utility commands
-;;; ============================================================
-
-;;;###autoload
-(defun java-server-mapper-find-xml ()
-  "Jump from a Java mapper file to the corresponding XML mapper file.
-If the cursor is on a method name, jump to that method's definition
-in the XML file.  Uses xref marker stack for navigation back."
-  (interactive)
-  (let* ((java-file (buffer-file-name))
-         (xml-file (and java-file
-                        (concat (file-name-sans-extension java-file) ".xml")))
-         (method-name (thing-at-point 'symbol t)))
-    (if (and xml-file (file-exists-p xml-file))
-        (progn
-          (xref-push-marker-stack)
-          (find-file xml-file)
-          (goto-char (point-min))
-          (if method-name
-              (if (re-search-forward
-                   (concat "id=\"\\(" (regexp-quote method-name) "\\)\"")
-                   nil t)
-                  (message "Jumped to method: %s" method-name)
-                (message "Method '%s' not found in XML file." method-name))
-            (message "Opened XML file. Put point on Java method and retry to jump by id.")))
-      (message "No corresponding XML file found."))))
-
-;;;###autoload
-(defun java-server-decompile-class ()
-  "Decompile the current .class file using FernFlower."
-  (interactive)
-  (let ((current-file (buffer-file-name)))
-    (unless (and current-file
-                 (string-equal (file-name-extension current-file) "class"))
-      (user-error "This command can only be run on .class files"))
-    (let* ((output-dir (concat (file-name-directory current-file) "decompiled/"))
-           (decompiled-file (concat output-dir (file-name-base current-file) ".java"))
-           (command (format "fernflower %s %s"
-                            (shell-quote-argument current-file)
-                            (shell-quote-argument output-dir))))
-      (unless (file-directory-p output-dir)
-        (make-directory output-dir t))
-      (message "Running FernFlower decompiler...")
-      (shell-command command)
-      (if (file-exists-p decompiled-file)
-          (find-file decompiled-file)
-        (user-error "Decompiled file not found at %s" decompiled-file)))))
 
 (provide 'java-server)
 ;;; java-server.el ends here

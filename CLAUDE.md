@@ -1,7 +1,9 @@
 # java-server Development Guide
 
 Single-file Emacs package for Java server container management (Tomcat, Spring Boot),
-with JDK auto-detection and optional dape integration.
+with JDK auto-detection and optional dape integration.  Does NOT include general
+Java editing utilities (MyBatis navigation, decompilation) — those belong in
+personal config or a separate package.
 
 ## First Principles
 
