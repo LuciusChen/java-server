@@ -112,7 +112,8 @@ This bypasses java-debug's unreliable HCR bookkeeping."
 
 (defcustom java-server-direct-attach-hcr-helper-dir
   (expand-file-name "java-server-hcr/" user-emacs-directory)
-  "Directory where java-server stores its Attach API helper sources."
+  "Base directory where java-server stores its Attach API helper caches.
+java-server keeps one helper cache per JDK major version under this directory."
   :type 'directory
   :group 'java-server)
 
@@ -1186,6 +1187,29 @@ Inner classes are treated as a hit for their top-level class."
                (file-name-nondirectory program)
                (string-trim output))))))
 
+(defun java-server--jdk-major-version-string (version)
+  "Return the JDK major version parsed from VERSION."
+  (cond
+   ((string-match "\\`1\\.\\([0-9]+\\)\\(?:[._].*\\)?\\'" version)
+    (match-string 1 version))
+   ((string-match "\\`\\([0-9]+\\)\\(?:[._].*\\)?\\'" version)
+    (match-string 1 version))
+   (t nil)))
+
+(defun java-server--direct-hcr-helper-cache-dir (jdk-home)
+  "Return the helper cache dir for JDK-HOME."
+  (let* ((base-dir (file-name-as-directory java-server-direct-attach-hcr-helper-dir))
+         (release-file (expand-file-name "release" jdk-home))
+         (major-version
+          (when (file-exists-p release-file)
+            (with-temp-buffer
+              (insert-file-contents release-file)
+              (when (re-search-forward "^JAVA_VERSION=\"\\([^\"]+\\)\"" nil t)
+                (java-server--jdk-major-version-string
+                 (match-string-no-properties 1))))))
+         (cache-name (format "jdk-%s" (or major-version "unknown"))))
+    (expand-file-name (file-name-as-directory cache-name) base-dir)))
+
 (defun java-server--direct-hcr-jdk-home (&optional details)
   "Return a JDK home suitable for direct Attach API HCR."
   (or (ignore-errors (java-server--resolve-project-jdk))
@@ -1204,7 +1228,7 @@ Inner classes are treated as a hit for their top-level class."
 
 (defun java-server--direct-hcr-helper-jar (jdk-home)
   "Ensure the direct Attach API helper exists for JDK-HOME and return its JAR."
-  (let* ((helper-dir (file-name-as-directory java-server-direct-attach-hcr-helper-dir))
+  (let* ((helper-dir (java-server--direct-hcr-helper-cache-dir jdk-home))
          (src-dir (expand-file-name "inspect/" helper-dir))
          (classes-dir (expand-file-name "classes/" helper-dir))
          (agent-java (expand-file-name "DirectRedefineAgent.java" src-dir))
@@ -1277,8 +1301,8 @@ Inner classes are treated as a hit for their top-level class."
          (jar-file (java-server--direct-hcr-helper-jar jdk-home))
          (tools-jar (expand-file-name "lib/tools.jar" jdk-home))
          (class-name (java-server--class-file-binary-name details class-file))
-         (status-file (expand-file-name "status.txt"
-                                        java-server-direct-attach-hcr-helper-dir))
+         (helper-dir (java-server--direct-hcr-helper-cache-dir jdk-home))
+         (status-file (make-temp-file (expand-file-name "status-" helper-dir)))
          (classpath (if (file-exists-p tools-jar)
                         (mapconcat #'identity (list tools-jar jar-file) path-separator)
                       jar-file))
@@ -1286,18 +1310,21 @@ Inner classes are treated as a hit for their top-level class."
                              class-name class-file status-file)))
     (unless (file-executable-p java)
       (error "No java launcher found in %s" jdk-home))
-    (when (file-exists-p status-file)
-      (delete-file status-file))
-    (java-server--run-process-file-checked
-     java "-cp" classpath "inspect.LoadAgent" pid jar-file agent-args)
-    (unless (file-exists-p status-file)
-      (error "Direct HCR helper produced no status file"))
-    (with-temp-buffer
-      (insert-file-contents status-file)
-      (cond
-       ((string-prefix-p "OK" (buffer-string)) 'ok)
-       ((string-prefix-p "NOT_LOADED" (buffer-string)) 'not-loaded)
-       (t (error "Direct HCR failed: %s" (string-trim (buffer-string))))))))
+    (unwind-protect
+        (progn
+          (delete-file status-file)
+          (java-server--run-process-file-checked
+           java "-cp" classpath "inspect.LoadAgent" pid jar-file agent-args)
+          (unless (file-exists-p status-file)
+            (error "Direct HCR helper produced no status file"))
+          (with-temp-buffer
+            (insert-file-contents status-file)
+            (cond
+             ((string-prefix-p "OK" (buffer-string)) 'ok)
+             ((string-prefix-p "NOT_LOADED" (buffer-string)) 'not-loaded)
+             (t (error "Direct HCR failed: %s" (string-trim (buffer-string)))))))
+      (when (file-exists-p status-file)
+        (delete-file status-file)))))
 
 (defun java-server--direct-hot-replace-available-p (details targets)
   "Return non-nil when DETAILS and TARGETS can use direct Attach API HCR."

@@ -124,6 +124,26 @@
         (should-not java-server--pending-hcr-project-details)
         (should-not java-server--pending-hcr-target-classes)))))
 
+(ert-deftest java-server-direct-hcr-helper-cache-dir-uses-jdk-major-version ()
+  (let* ((base-dir (make-temp-file "java-server-hcr-base" t))
+         (jdk-home (make-temp-file "java-server-jdk" t))
+         (release-file (expand-file-name "release" jdk-home))
+         (java-server-direct-attach-hcr-helper-dir base-dir))
+    (unwind-protect
+        (progn
+          (with-temp-file release-file
+            (insert "JAVA_VERSION=\"1.8.0_301\"\n"))
+          (should
+           (equal (java-server--direct-hcr-helper-cache-dir jdk-home)
+                  (expand-file-name "jdk-8/" base-dir)))
+          (with-temp-file release-file
+            (insert "JAVA_VERSION=\"17.0.10\"\n"))
+          (should
+           (equal (java-server--direct-hcr-helper-cache-dir jdk-home)
+                  (expand-file-name "jdk-17/" base-dir))))
+      (delete-directory base-dir t)
+      (delete-directory jdk-home t))))
+
 (ert-deftest java-server-hcr-does-not-reenter-while-in-progress ()
   (let ((messages nil)
         (dape-called nil)

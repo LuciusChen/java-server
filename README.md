@@ -78,7 +78,7 @@ Current HCR flow:
 
 1. Resolve the active project and saved top-level class names.
 2. Find the local JVM PID for the Tomcat or Spring Boot process started by `java-server`.
-3. Compile or reuse a tiny Attach API helper under `~/.emacs.d/java-server-hcr/`.
+3. Compile or reuse a tiny Attach API helper under `~/.emacs.d/java-server-hcr/`, cached per JDK major version.
 4. Use the Attach API to load an agent into the target JVM and call `Instrumentation.redefineClasses(...)` for the changed class files.
 5. For local Tomcat exploded deployments, sync the same class family into `webapps/<project>/WEB-INF/classes/` as a fallback for classes that were not yet loaded.
 
