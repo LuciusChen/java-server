@@ -5,11 +5,26 @@ with JDK auto-detection and optional dape integration.  Does NOT include general
 Java editing utilities (MyBatis navigation, decompilation) — those belong in
 personal config or a separate package.
 
+## Shared Guidelines
+
+Also follow:
+- `~/repos/coding-guidelines/general.md`
+- `~/repos/coding-guidelines/elisp.md`
+
+Keep this file focused on package-specific constraints that are not already covered there.
+
 ## First Principles
 
 - **Question every abstraction**: Before adding a layer or indirection, ask "is this solving a real problem right now?" If the answer is hypothetical, don't add it.
 - **Simplify relentlessly**: Three similar lines of code are better than a premature abstraction. This is a single-file package — keep it that way unless a genuinely distinct responsibility emerges.
 - **Delete, don't deprecate**: If something is unused, remove it entirely. No backward-compatibility shims, no re-exports, no "removed" comments.
+
+## Diagnosis and Testing
+
+- **Find the root cause before changing behavior**: Do not stack timing or fallback patches without naming the failing layer.
+- **After two failed fixes, stop patching and switch to diagnosis**: Gather logs, adapter events, or runtime evidence before changing behavior again.
+- **Prefer failing regression tests for bug fixes**: When practical, add the test before the fix and make sure it proves the bug.
+- **Errors must surface clearly**: Catch only at the outer boundary where the package can turn failures into user-facing messages.
 
 ## Architecture
 

@@ -20,12 +20,24 @@
 
 (require 'cl-lib)
 (require 'seq)
+(require 'subr-x)
 (require 'project)
 
 (declare-function eglot-current-server "eglot")
 (declare-function eglot-execute-command "eglot")
+(declare-function eglot--managed-buffers "eglot")
+(declare-function eglot--project "eglot")
 (declare-function dape "dape")
+(declare-function dape--config "dape")
+(declare-function dape-continue "dape")
+(declare-function dape-handle-event "dape")
+(declare-function dape-pause "dape")
+(declare-function dape-request "dape")
+(declare-function dape--state "dape")
+(declare-function jsonrpc-running-p "jsonrpc")
 (declare-function notifications-notify "notifications")
+(defvar dape-request-timeout)
+(defvar eglot--servers-by-project)
 
 ;;; ============================================================
 ;;; Module 1: Customization
@@ -65,6 +77,43 @@
 (defcustom java-server-auto-dape-on-debug t
   "Whether to automatically invoke dape after debug server is ready."
   :type 'boolean
+  :group 'java-server)
+
+(defcustom java-server-hot-code-replace-mode 'auto
+  "Hot code replace mode for Java debug sessions.
+`auto'   — replace classes after java-debug reports a completed build.
+`manual' — use `java-server-hot-replace' to trigger manually.
+`never'  — disable hot code replace."
+  :type '(choice (const auto)
+                 (const manual)
+                 (const never))
+  :group 'java-server)
+
+(defcustom java-server-jdwp-request-timeout 30000
+  "JDWP request timeout in milliseconds for java-debug operations.
+This is synced to java-debug via `vscode.java.updateDebugSettings'."
+  :type 'natnum
+  :group 'java-server)
+
+(defcustom java-server-tomcat-sync-classes-on-hcr t
+  "Whether to sync saved class files into Tomcat's exploded webapp after HCR.
+This is a fallback for local Tomcat workflows where the deployed
+`WEB-INF/classes' tree lags behind the project's compiled classes output."
+  :type 'boolean
+  :group 'java-server)
+
+(defcustom java-server-direct-attach-hcr t
+  "Whether to prefer direct JVM class redefinition for local debug sessions.
+When non-nil, java-server uses the Attach API to redefine saved classes
+inside Tomcat or Spring Boot processes launched by java-server itself.
+This bypasses java-debug's unreliable HCR bookkeeping."
+  :type 'boolean
+  :group 'java-server)
+
+(defcustom java-server-direct-attach-hcr-helper-dir
+  (expand-file-name "java-server-hcr/" user-emacs-directory)
+  "Directory where java-server stores its Attach API helper sources."
+  :type 'directory
   :group 'java-server)
 
 
@@ -258,6 +307,9 @@ If no matching version is found, prompt the user to choose."
 (defvar java-server--tomcat-status nil
   "Current Tomcat server status: nil, `starting', `running', or `failed'.")
 
+(defvar java-server--tomcat-project-details nil
+  "Project details plist for the Tomcat instance launched by java-server.")
+
 (defvar java-server--tomcat-mode-line nil
   "Mode-line string for Tomcat status.")
 (put 'java-server--tomcat-mode-line 'risky-local-variable t)
@@ -341,9 +393,10 @@ DEBUG indicates JPDA mode."
                "pgrep -f 'org.apache.catalina.startup.Bootstrap'"))))
     (unless (string-empty-p pid) pid)))
 
-(defun java-server--tomcat-startup-filter (debug)
+(defun java-server--tomcat-startup-filter (debug details)
   "Return a process filter that detects Tomcat startup.
-DEBUG non-nil means JPDA mode is active."
+DEBUG non-nil means JPDA mode is active.
+DETAILS is the project plist used for debugger attach."
   (let ((notified nil)
         (line-count 0)
         (call-count 0))
@@ -370,34 +423,38 @@ DEBUG non-nil means JPDA mode is active."
                  (if debug (format " [JPDA :%d]" java-server-tomcat-debug-port) "")
                  java-server-tomcat-port)
         (when (and debug java-server-auto-dape-on-debug)
-          (java-server--dape-attach java-server-tomcat-debug-port))))))
+          (java-server--dape-attach java-server-tomcat-debug-port details))))))
 
-(defun java-server--tomcat-do-start (proc-name buf-name start-cmd debug)
+(defun java-server--tomcat-do-start (proc-name buf-name start-cmd debug details)
   "Start Tomcat process PROC-NAME in BUF-NAME using START-CMD.
-DEBUG non-nil means JPDA mode."
+DEBUG non-nil means JPDA mode.
+DETAILS is the project plist used for debugger attach."
   (message "Starting Tomcat%s..." (if debug " with JPDA" ""))
   (java-server--tomcat-set-status 'starting)
+  (setq java-server--tomcat-project-details details)
   (let ((proc (start-process-shell-command proc-name buf-name start-cmd)))
-    (set-process-filter proc (java-server--tomcat-startup-filter debug))
+    (set-process-filter proc (java-server--tomcat-startup-filter debug details))
     (set-process-sentinel
      proc
      (lambda (_proc event)
        (when (string-match-p
               (rx (or "finished" "exited" "failed" "killed"))
               event)
-         (java-server--tomcat-set-status nil))))))
+         (java-server--tomcat-set-status nil)
+         (setq java-server--tomcat-project-details nil))))))
 
-(defun java-server--tomcat-wait-then-start (proc-name buf-name start-cmd debug remaining env)
+(defun java-server--tomcat-wait-then-start (proc-name buf-name start-cmd debug remaining env details)
   "Poll until Tomcat port closes, then start.
 Retry every second up to REMAINING times.
-ENV is the `process-environment' to use for the subprocess."
+ENV is the `process-environment' to use for the subprocess.
+DETAILS is the project plist used for debugger attach."
   (cond
    ((not (java-server--port-open-p "localhost" java-server-tomcat-port))
     (let ((process-environment env))
-      (java-server--tomcat-do-start proc-name buf-name start-cmd debug)))
+      (java-server--tomcat-do-start proc-name buf-name start-cmd debug details)))
    ((> remaining 0)
     (run-with-timer 1 nil #'java-server--tomcat-wait-then-start
-                    proc-name buf-name start-cmd debug (1- remaining) env))
+                    proc-name buf-name start-cmd debug (1- remaining) env details))
    (t
     (message "Tomcat did not stop within timeout. Aborting deploy."))))
 
@@ -449,8 +506,8 @@ Uses project-specific JDK if detected, without changing global JAVA_HOME."
           (progn
             (java-server-tomcat-stop)
             (java-server--tomcat-wait-then-start
-             proc-name buf-name startup-command debug 30 process-environment))
-        (java-server--tomcat-do-start proc-name buf-name startup-command debug)))))
+             proc-name buf-name startup-command debug 30 process-environment details))
+        (java-server--tomcat-do-start proc-name buf-name startup-command debug details)))))
 
 ;;;###autoload
 (defun java-server-tomcat-stop ()
@@ -466,6 +523,7 @@ Try catalina.sh stop first, wait 2s, then kill process group if needed."
     (if (not pid)
         (message ">>> No Tomcat process found.")
       (java-server--tomcat-set-status nil)
+      (setq java-server--tomcat-project-details nil)
       (message ">>> Trying catalina.sh stop...")
       (start-process-shell-command "tomcat-stop" "*tomcat-stop*"
                                    (concat (shell-quote-argument catalina-script) " stop"))
@@ -532,6 +590,9 @@ for the build subprocess without changing the global JAVA_HOME."
 (defvar java-server--spring-boot-process nil
   "The running Spring Boot process object.")
 
+(defvar java-server--spring-boot-project-details nil
+  "Project details plist for the Spring Boot instance launched by java-server.")
+
 (defvar java-server--spring-boot-status nil
   "Current Spring Boot status: nil, `starting', `running', or `failed'.")
 
@@ -580,9 +641,10 @@ Exclude files containing \"-original\" or \"-plain\"."
                   (string-match-p "-plain" name)))))
      (directory-files dir t "\\.jar$"))))
 
-(defun java-server--spring-boot-startup-filter (debug)
+(defun java-server--spring-boot-startup-filter (debug details)
   "Return a process filter that detects Spring Boot startup.
-DEBUG non-nil means JPDA is active."
+DEBUG non-nil means JPDA is active.
+DETAILS is the project plist used for debugger attach."
   (let ((notified nil)
         (line-count 0)
         (call-count 0))
@@ -611,7 +673,7 @@ DEBUG non-nil means JPDA is active."
         (message "Spring Boot ready%s"
                  (if debug (format " [JPDA :%d]" java-server-spring-boot-debug-port) ""))
         (when (and debug java-server-auto-dape-on-debug)
-          (java-server--dape-attach java-server-spring-boot-debug-port))))))
+          (java-server--dape-attach java-server-spring-boot-debug-port details))))))
 
 (defun java-server--spring-boot-build-cmd (details)
   "Return the build command string for DETAILS."
@@ -646,8 +708,9 @@ DEBUG non-nil enables JPDA."
            (proc-name (format "spring-boot[%s]" name))
            (proc (start-process-shell-command proc-name buf-name cmd)))
       (setq java-server--spring-boot-process proc)
+      (setq java-server--spring-boot-project-details details)
       (java-server--spring-boot-set-status 'starting)
-      (set-process-filter proc (java-server--spring-boot-startup-filter debug))
+      (set-process-filter proc (java-server--spring-boot-startup-filter debug details))
       (set-process-sentinel
        proc
        (lambda (_proc event)
@@ -655,7 +718,8 @@ DEBUG non-nil enables JPDA."
                 (rx (or "finished" "exited" "failed" "killed"))
                 event)
            (java-server--spring-boot-set-status nil)
-           (setq java-server--spring-boot-process nil)))))))
+           (setq java-server--spring-boot-process nil
+                 java-server--spring-boot-project-details nil)))))))
 
 ;;;###autoload
 (defun java-server-spring-boot-run (debug)
@@ -698,6 +762,7 @@ for build and run subprocesses without changing the global JAVA_HOME."
       (progn
         (kill-process java-server--spring-boot-process)
         (setq java-server--spring-boot-process nil)
+        (setq java-server--spring-boot-project-details nil)
         (java-server--spring-boot-set-status nil)
         (message "Spring Boot stopped."))
     (message "No Spring Boot process running.")))
@@ -706,23 +771,674 @@ for build and run subprocesses without changing the global JAVA_HOME."
 ;;; Module 6: dape integration
 ;;; ============================================================
 
-(defun java-server--dape-attach (jpda-port)
+(defun java-server--dape-attach (jpda-port &optional details)
   "Attach dape debugger to JPDA-PORT.
 If eglot+JDTLS is available, use JDTLS debug adapter.
-Otherwise report that manual setup is needed."
+DETAILS is the project plist used to find the matching server."
   (unless (featurep 'dape)
     (user-error "dape is not loaded; cannot attach debugger"))
-  (if-let* ((server (and (featurep 'eglot)
-                         (ignore-errors (eglot-current-server))))
-            (adapter-port (ignore-errors
-                            (eglot-execute-command
-                             server "vscode.java.startDebugSession" nil))))
-      (progn
+  (condition-case err
+      (let* ((config (java-server--dape-resolve-attach-config
+                      `(:port ,jpda-port) details))
+             (adapter-port (plist-get config 'port)))
         (message "Attaching dape via JDTLS debug adapter on port %s..." adapter-port)
-        (dape `(:request "attach"
-                :hostname "localhost"
-                :port ,adapter-port)))
-    (message "No JDTLS server found. Use M-x dape to attach manually to port %d." jpda-port)))
+        (dape config))
+    (error
+     (message "Debugger auto-attach skipped: %s" (error-message-string err)))))
+
+(defun java-server--project-path-match-p (path project-home)
+  "Return non-nil if PATH belongs to PROJECT-HOME."
+  (let ((path (file-name-as-directory (file-truename path)))
+        (project-home (file-name-as-directory (file-truename project-home))))
+    (or (string= path project-home)
+        (file-in-directory-p path project-home)
+        (file-in-directory-p project-home path))))
+
+(defun java-server--project-eglot-buffer (project-home)
+  "Return a buffer under PROJECT-HOME with an active JDTLS server."
+  (seq-find
+   (lambda (buffer)
+     (when-let* ((file (buffer-local-value 'buffer-file-name buffer)))
+       (with-current-buffer buffer
+         (and (java-server--project-path-match-p file project-home)
+              (ignore-errors (eglot-current-server))))))
+   (buffer-list)))
+
+(defun java-server--project-eglot-server-from-registry (project-home)
+  "Return a running JDTLS server for PROJECT-HOME from Eglot's registry."
+  (when (and (featurep 'eglot)
+             (boundp 'eglot--servers-by-project))
+    (let (match)
+      (maphash
+       (lambda (project servers)
+         (when-let* ((root (ignore-errors (project-root project)))
+                     ((java-server--project-path-match-p project-home root))
+                     (server (seq-find #'jsonrpc-running-p servers)))
+           (setq match (or match server))))
+       eglot--servers-by-project)
+      match)))
+
+(defun java-server--project-eglot-server (details)
+  "Return the JDTLS server associated with DETAILS, or nil."
+  (when (featurep 'eglot)
+    (when-let* ((home (plist-get details :home)))
+      (or (when-let* ((buffer (java-server--project-eglot-buffer home)))
+            (with-current-buffer buffer
+              (eglot-current-server)))
+          (java-server--project-eglot-server-from-registry home)))))
+
+(defun java-server--hot-code-replace-setting ()
+  "Return the java-debug hot code replace setting string."
+  (pcase java-server-hot-code-replace-mode
+    ('auto "auto")
+    ('manual "manual")
+    (_ "never")))
+
+(defun java-server--debug-settings-json ()
+  "Return the java-debug settings JSON string."
+  (format
+   "{\"hotCodeReplace\":\"%s\",\"jdwpRequestTimeout\":%d,\"logLevel\":\"INFO\"}"
+   (java-server--hot-code-replace-setting)
+   java-server-jdwp-request-timeout))
+
+(defun java-server--sync-debug-settings (server)
+  "Sync java-debug settings to SERVER.
+Ignore command failures because some JDTLS builds reject this command
+even though the debug session itself can still be started."
+  (condition-case err
+      (eglot-execute-command
+       server "vscode.java.updateDebugSettings"
+       (vector (java-server--debug-settings-json)))
+    (error
+     (message "java-debug settings sync skipped: %s"
+              (error-message-string err))
+     nil)))
+
+(defun java-server--start-debug-session (details)
+  "Start a JDTLS-backed java debug session for DETAILS.
+Return the adapter port."
+  (if-let* ((server (java-server--project-eglot-server details)))
+      (progn
+        (java-server--sync-debug-settings server)
+        (condition-case err
+            (eglot-execute-command server "vscode.java.startDebugSession" nil)
+          (error
+           (user-error "java-debug startDebugSession failed: %s"
+                       (error-message-string err)))))
+    (user-error "No active JDTLS server found for %s" (plist-get details :home))))
+
+(defun java-server--dape-resolve-attach-config (config &optional details)
+  "Resolve dape CONFIG for a Java JPDA attach session.
+DETAILS is the project plist used to find the matching JDTLS server."
+  (let* ((details (or details (java-server--detect-project)))
+         (project-home (plist-get details :home))
+         (project-name (plist-get details :name))
+         (jpda-port (or (plist-get config :port)
+                        (plist-get config 'jpda-port)
+                        (user-error "Missing JPDA port")))
+         (adapter-port (java-server--start-debug-session details))
+         (config (copy-tree config)))
+    (setq config (plist-put config 'host "localhost"))
+    (setq config (plist-put config 'port adapter-port))
+    (setq config (plist-put config :type "java"))
+    (setq config (plist-put config :request "attach"))
+    (setq config (plist-put config :hostName
+                            (or (plist-get config :hostName) "localhost")))
+    (setq config (plist-put config :port jpda-port))
+    (setq config (plist-put config :projectName
+                            (or (plist-get config :projectName) project-name)))
+    (setq config (plist-put config 'project-details details))
+    (setq config (plist-put config :sourcePaths
+                            (or (plist-get config :sourcePaths)
+                                (vector project-home))))
+    (plist-put config :timeout (or (plist-get config :timeout) 30000))))
+
+(defun java-server--ensure-dape-attach-prerequisites (config)
+  "Validate CONFIG can attach through JDTLS."
+  (let ((details (or (plist-get config 'project-details)
+                     (java-server--detect-project))))
+    (unless (java-server--project-eglot-server details)
+      (user-error "No active JDTLS server found for %s" (plist-get details :home)))))
+
+(defun java-server--active-dape-connection ()
+  "Return the current live dape connection, or nil."
+  (when (featurep 'dape)
+    (when-let* ((conn (and (boundp 'dape--connection)
+                           (symbol-value 'dape--connection))))
+      (and (ignore-errors (jsonrpc-running-p conn)) conn))))
+
+(defun java-server--dape-stopped-p (conn)
+  "Return non-nil if CONN is currently stopped."
+  (eq (ignore-errors (dape--state conn)) 'stopped))
+
+(defvar java-server--pending-hcr-target-classes nil
+  "Top-level Java classes saved since the last hot code replace request.")
+
+(defvar java-server--pending-hcr-project-details nil
+  "Project details plist captured from the last saved Java buffer for HCR.")
+
+(defvar java-server--hcr-in-progress nil
+  "Non-nil while a hot code replace request is in flight.")
+
+(defvar java-server--pending-hot-replace nil
+  "Non-nil when a hot code replace should run on the next stop event.")
+
+(defvar java-server--hcr-auto-resume nil
+  "Non-nil when java-server should resume after an auto-paused HCR.")
+
+(defvar java-server--active-debug-project-details nil
+  "Project details plist for the current java-server-managed dape session.")
+
+(defun java-server--same-project-home-p (left right)
+  "Return non-nil when LEFT and RIGHT denote the same project root."
+  (and left
+       right
+       (string=
+        (file-name-as-directory (file-truename left))
+        (file-name-as-directory (file-truename right)))))
+
+(defun java-server--classes-output-root (details &optional existing-only)
+  "Return the compiled classes root for project DETAILS.
+When EXISTING-ONLY is non-nil, return nil unless the directory exists."
+  (when-let* ((project-home (plist-get details :home)))
+    (let* ((candidates
+            (pcase (plist-get details :build-system)
+              ('gradle '("build/classes/java/main/"
+                         "build/classes/kotlin/main/"
+                         "build/classes/main/"
+                         "target/classes/"))
+              (_ '("target/classes/"
+                   "build/classes/java/main/"
+                   "build/classes/kotlin/main/"
+                   "build/classes/main/"))))
+           (paths (mapcar (lambda (relative)
+                            (expand-file-name relative project-home))
+                          candidates))
+           (existing (seq-find #'file-directory-p paths)))
+      (if existing-only
+          existing
+        (or existing (car paths))))))
+
+(defun java-server--buffer-java-primary-class ()
+  "Return the current buffer's top-level Java class name, or nil."
+  (when-let* ((file buffer-file-name)
+              ((string-suffix-p ".java" file))
+              (base (file-name-base file))
+              ((not (member base '("package-info" "module-info")))))
+    (let ((package
+           (save-excursion
+             (goto-char (point-min))
+             (when (re-search-forward
+                    "^[[:space:]]*package[[:space:]]+\\([[:word:].]+\\)[[:space:]]*;"
+                    nil t)
+               (match-string-no-properties 1)))))
+      (if (and package (not (string= package "")))
+          (concat package "." base)
+        base))))
+
+(defun java-server--track-saved-java-class ()
+  "Remember the current Java buffer's top-level class for the next HCR."
+  (when (and (java-server--active-dape-connection)
+             java-server--active-debug-project-details
+             (derived-mode-p 'java-mode 'java-ts-mode))
+    (when-let* ((details
+                 (ignore-errors
+                   (java-server--detect-project (file-name-directory buffer-file-name))))
+                ((java-server--same-project-home-p
+                  (plist-get details :home)
+                  (plist-get java-server--active-debug-project-details :home)))
+                (class-name (java-server--buffer-java-primary-class)))
+      (setq java-server--pending-hcr-project-details
+            java-server--active-debug-project-details)
+      (cl-pushnew class-name java-server--pending-hcr-target-classes
+                  :test #'equal))))
+
+(defun java-server--hcr-target-hit-p (target-class changed-classes)
+  "Return non-nil when TARGET-CLASS is present in CHANGED-CLASSES.
+Inner classes are treated as a hit for their top-level class."
+  (let ((inner-prefix (concat target-class "$")))
+    (seq-some (lambda (class-name)
+                (or (equal class-name target-class)
+                    (string-prefix-p inner-prefix class-name)))
+              changed-classes)))
+
+(defun java-server--hcr-result-message (changed-classes)
+  "Format a user-facing HCR result message for CHANGED-CLASSES."
+  (let* ((reported (length changed-classes))
+         (targets java-server--pending-hcr-target-classes)
+         (matched (seq-filter
+                   (lambda (target)
+                     (java-server--hcr-target-hit-p target changed-classes))
+                   targets)))
+    (cond
+     ((zerop reported)
+      "HCR completed; java-debug reported no pending class-file changes.")
+     ((null targets)
+      (format "HCR completed; java-debug reported %d built class changes."
+              reported))
+     ((null matched)
+      (format "HCR completed; java-debug reported %d built class changes, but not the last saved class (%s)."
+              reported
+              (mapconcat #'identity targets ", ")))
+     (t
+      (format "HCR completed; java-debug reported %d built class changes, including %s."
+              reported
+              (mapconcat #'identity matched ", "))))))
+
+(defun java-server--tomcat-exploded-classes-dir (details)
+  "Return Tomcat exploded `WEB-INF/classes' dir for project DETAILS, or nil."
+  (when-let* ((tomcat-home (and java-server-tomcat-sync-classes-on-hcr
+                                (java-server--detect-tomcat-home)))
+              (project-name (plist-get details :name))
+              (classes-dir (expand-file-name
+                            (format "webapps/%s/WEB-INF/classes/" project-name)
+                            tomcat-home))
+              ((file-directory-p classes-dir)))
+    classes-dir))
+
+(defun java-server--class-family-files (details class-name)
+  "Return compiled class files for CLASS-NAME for project DETAILS."
+  (let* ((parts (split-string class-name "\\."))
+         (base-name (car (last parts)))
+         (package-dir (mapconcat #'identity (butlast parts) "/"))
+         (classes-root (java-server--classes-output-root details 'existing-only))
+         (classes-dir (and classes-root
+                           (expand-file-name package-dir classes-root))))
+    (when (file-directory-p classes-dir)
+      (directory-files
+       classes-dir t
+       (concat "^" (regexp-quote base-name) "\\(?:\\$.*\\)?\\.class$")
+       t))))
+
+(defun java-server--sync-class-family-to-tomcat (details class-name)
+  "Copy CLASS-NAME compiled class files into the local Tomcat exploded webapp."
+  (when-let* ((classes-dir (java-server--tomcat-exploded-classes-dir details))
+              (source-files (java-server--class-family-files details class-name)))
+    (let* ((parts (split-string class-name "\\."))
+           (package-dir (mapconcat #'identity (butlast parts) "/"))
+           (dest-dir (expand-file-name package-dir classes-dir)))
+      (make-directory dest-dir t)
+      (dolist (file source-files)
+        (copy-file file (expand-file-name (file-name-nondirectory file) dest-dir) t))
+      (length source-files))))
+
+(defun java-server--sync-hcr-target-classes-to-tomcat (details targets)
+  "Sync TARGETS from PROJECT DETAILS into the local Tomcat exploded webapp."
+  (when (and details targets)
+    (apply #'+
+           (mapcar (lambda (class-name)
+                     (or (java-server--sync-class-family-to-tomcat details class-name) 0))
+                   targets))))
+
+(defconst java-server--direct-hcr-agent-source
+  (mapconcat
+   #'identity
+   '("package inspect;"
+     ""
+     "import java.io.PrintWriter;"
+     "import java.io.StringWriter;"
+     "import java.lang.instrument.ClassDefinition;"
+     "import java.lang.instrument.Instrumentation;"
+     "import java.nio.charset.StandardCharsets;"
+     "import java.nio.file.Files;"
+     "import java.nio.file.Paths;"
+     ""
+     "public final class DirectRedefineAgent {"
+     "    private DirectRedefineAgent() {}"
+     ""
+     "    public static void agentmain(String agentArgs, Instrumentation inst) throws Exception {"
+     "        String statusFile = null;"
+     "        try {"
+     "            String className = null;"
+     "            String classFile = null;"
+     "            for (String piece : agentArgs.split(\"[;\\\\n]\")) {"
+     "                int idx = piece.indexOf('=');"
+     "                if (idx <= 0) continue;"
+     "                String key = piece.substring(0, idx);"
+     "                String value = piece.substring(idx + 1);"
+     "                if (\"class\".equals(key)) className = value;"
+     "                else if (\"file\".equals(key)) classFile = value;"
+     "                else if (\"status\".equals(key)) statusFile = value;"
+     "            }"
+     "            if (className == null || classFile == null || statusFile == null) {"
+     "                throw new IllegalArgumentException(\"Missing class/file/status\");"
+     "            }"
+     "            Class<?> target = null;"
+     "            for (Class<?> candidate : inst.getAllLoadedClasses()) {"
+     "                if (candidate.getName().equals(className)) {"
+     "                    target = candidate;"
+     "                    break;"
+     "                }"
+     "            }"
+     "            if (target == null) {"
+     "                write(statusFile, \"NOT_LOADED\\n\");"
+     "                return;"
+     "            }"
+     "            byte[] bytes = Files.readAllBytes(Paths.get(classFile));"
+     "            inst.redefineClasses(new ClassDefinition(target, bytes));"
+     "            write(statusFile, \"OK\\n\");"
+     "        } catch (Throwable t) {"
+     "            if (statusFile == null) throw t;"
+     "            StringWriter sw = new StringWriter();"
+     "            t.printStackTrace(new PrintWriter(sw));"
+     "            write(statusFile, \"ERROR\\n\" + sw.toString());"
+     "        }"
+     "    }"
+     ""
+     "    private static void write(String path, String content) throws Exception {"
+     "        Files.write(Paths.get(path), content.getBytes(StandardCharsets.UTF_8));"
+     "    }"
+     "}")
+   "\n"))
+
+(defconst java-server--direct-hcr-loader-source
+  (mapconcat
+   #'identity
+   '("package inspect;"
+     ""
+     "import com.sun.tools.attach.VirtualMachine;"
+     ""
+     "public final class LoadAgent {"
+     "    private LoadAgent() {}"
+     ""
+     "    public static void main(String[] args) throws Exception {"
+     "        if (args.length != 3) {"
+     "            throw new IllegalArgumentException(\"usage: <pid> <agent-jar> <agent-args>\");"
+     "        }"
+     "        VirtualMachine vm = VirtualMachine.attach(args[0]);"
+     "        try {"
+     "            vm.loadAgent(args[1], args[2]);"
+     "        } finally {"
+     "            vm.detach();"
+     "        }"
+     "    }"
+     "}")
+   "\n"))
+
+(defconst java-server--direct-hcr-manifest
+  (mapconcat
+   #'identity
+   '("Manifest-Version: 1.0"
+     "Agent-Class: inspect.DirectRedefineAgent"
+     "Can-Redefine-Classes: true"
+     "")
+   "\n"))
+
+(defun java-server--write-file-if-changed (file content)
+  "Write CONTENT to FILE only when the file contents differ."
+  (make-directory (file-name-directory file) t)
+  (unless (and (file-exists-p file)
+               (string= (with-temp-buffer
+                          (insert-file-contents file)
+                          (buffer-string))
+                        content))
+    (with-temp-file file
+      (insert content))))
+
+(defun java-server--run-process-file-checked (program &rest args)
+  "Run PROGRAM with ARGS and return stdout, or signal an error."
+  (with-temp-buffer
+    (let ((status (apply #'process-file program nil t nil args))
+          (output (buffer-string)))
+      (if (zerop status)
+          output
+        (error "%s failed: %s"
+               (file-name-nondirectory program)
+               (string-trim output))))))
+
+(defun java-server--direct-hcr-jdk-home (&optional details)
+  "Return a JDK home suitable for direct Attach API HCR."
+  (or (ignore-errors (java-server--resolve-project-jdk))
+      (getenv "JAVA_HOME")
+      (when (eq system-type 'darwin)
+        (let ((home (string-trim
+                     (shell-command-to-string "/usr/libexec/java_home 2>/dev/null"))))
+          (unless (string-empty-p home) home)))
+      (and details
+           (plist-get details :home)
+           (let* ((default-directory (plist-get details :home))
+                  (java-bin (executable-find "java")))
+             (when java-bin
+               (directory-file-name
+                (expand-file-name ".." (file-name-directory java-bin))))))))
+
+(defun java-server--direct-hcr-helper-jar (jdk-home)
+  "Ensure the direct Attach API helper exists for JDK-HOME and return its JAR."
+  (let* ((helper-dir (file-name-as-directory java-server-direct-attach-hcr-helper-dir))
+         (src-dir (expand-file-name "inspect/" helper-dir))
+         (classes-dir (expand-file-name "classes/" helper-dir))
+         (agent-java (expand-file-name "DirectRedefineAgent.java" src-dir))
+         (loader-java (expand-file-name "LoadAgent.java" src-dir))
+         (manifest (expand-file-name "MANIFEST.MF" helper-dir))
+         (jar-file (expand-file-name "direct-hcr-agent.jar" helper-dir))
+         (javac (expand-file-name "bin/javac" jdk-home))
+         (jar (expand-file-name "bin/jar" jdk-home))
+         (tools-jar (expand-file-name "lib/tools.jar" jdk-home)))
+    (unless (file-executable-p javac)
+      (error "No javac found in %s" jdk-home))
+    (unless (file-executable-p jar)
+      (error "No jar tool found in %s" jdk-home))
+    (java-server--write-file-if-changed agent-java java-server--direct-hcr-agent-source)
+    (java-server--write-file-if-changed loader-java java-server--direct-hcr-loader-source)
+    (java-server--write-file-if-changed manifest java-server--direct-hcr-manifest)
+    (when (or (not (file-exists-p jar-file))
+              (file-newer-than-file-p agent-java jar-file)
+              (file-newer-than-file-p loader-java jar-file)
+              (file-newer-than-file-p manifest jar-file))
+      (when (file-directory-p classes-dir)
+        (delete-directory classes-dir t))
+      (make-directory classes-dir t)
+      (if (file-exists-p tools-jar)
+          (java-server--run-process-file-checked
+           javac "-cp" tools-jar "-d" classes-dir agent-java loader-java)
+        (java-server--run-process-file-checked
+         javac "-d" classes-dir agent-java loader-java))
+      (when (file-exists-p jar-file)
+        (delete-file jar-file))
+      (java-server--run-process-file-checked
+       jar "cfm" jar-file manifest "-C" classes-dir "."))
+    jar-file))
+
+(defun java-server--project-hcr-pid (details)
+  "Return the local JVM PID for direct HCR for project DETAILS, or nil."
+  (let ((home (plist-get details :home)))
+    (cond
+     ((and home
+           java-server--spring-boot-project-details
+           (equal home (plist-get java-server--spring-boot-project-details :home))
+           java-server--spring-boot-process
+           (process-live-p java-server--spring-boot-process))
+      (number-to-string (process-id java-server--spring-boot-process)))
+     ((and home
+           java-server--tomcat-project-details
+           (equal home (plist-get java-server--tomcat-project-details :home)))
+      (java-server--tomcat-get-pid))
+     ((and home
+           (java-server--tomcat-exploded-classes-dir details)
+           (java-server--port-open-p "localhost" java-server-tomcat-debug-port))
+      (java-server--tomcat-get-pid)))))
+
+(defun java-server--class-file-binary-name (details class-file)
+  "Return the JVM binary name for CLASS-FILE for project DETAILS."
+  (let* ((classes-dir (file-name-as-directory
+                       (or (java-server--classes-output-root details)
+                           (error "Unable to resolve compiled classes root"))))
+         (relative (file-relative-name class-file classes-dir)))
+    (string-replace
+     "/"
+     "."
+     (string-remove-suffix ".class" relative))))
+
+(defun java-server--direct-redefine-class-file (details pid class-file)
+  "Directly redefine CLASS-FILE in PID for project DETAILS via the Attach API."
+  (let* ((jdk-home (or (java-server--direct-hcr-jdk-home details)
+                       (error "Unable to locate a JDK for direct HCR")))
+         (java (expand-file-name "bin/java" jdk-home))
+         (jar-file (java-server--direct-hcr-helper-jar jdk-home))
+         (tools-jar (expand-file-name "lib/tools.jar" jdk-home))
+         (class-name (java-server--class-file-binary-name details class-file))
+         (status-file (expand-file-name "status.txt"
+                                        java-server-direct-attach-hcr-helper-dir))
+         (classpath (if (file-exists-p tools-jar)
+                        (mapconcat #'identity (list tools-jar jar-file) path-separator)
+                      jar-file))
+         (agent-args (format "class=%s;file=%s;status=%s"
+                             class-name class-file status-file)))
+    (unless (file-executable-p java)
+      (error "No java launcher found in %s" jdk-home))
+    (when (file-exists-p status-file)
+      (delete-file status-file))
+    (java-server--run-process-file-checked
+     java "-cp" classpath "inspect.LoadAgent" pid jar-file agent-args)
+    (unless (file-exists-p status-file)
+      (error "Direct HCR helper produced no status file"))
+    (with-temp-buffer
+      (insert-file-contents status-file)
+      (cond
+       ((string-prefix-p "OK" (buffer-string)) 'ok)
+       ((string-prefix-p "NOT_LOADED" (buffer-string)) 'not-loaded)
+       (t (error "Direct HCR failed: %s" (string-trim (buffer-string))))))))
+
+(defun java-server--direct-hot-replace-available-p (details targets)
+  "Return non-nil when DETAILS and TARGETS can use direct Attach API HCR."
+  (and java-server-direct-attach-hcr
+       details
+       targets
+       (java-server--project-hcr-pid details)))
+
+(defun java-server--direct-hot-replace (details targets)
+  "Directly redefine TARGETS for project DETAILS via the Attach API."
+  (let* ((pid (or (java-server--project-hcr-pid details)
+                  (error "No local JVM PID available for direct HCR")))
+         (files (delete-dups
+                 (apply #'append
+                        (mapcar (lambda (target)
+                                  (java-server--class-family-files details target))
+                                targets))))
+         (applied 0)
+         (not-loaded 0))
+    (dolist (class-file files)
+      (pcase (java-server--direct-redefine-class-file details pid class-file)
+        ('ok (cl-incf applied))
+        ('not-loaded (cl-incf not-loaded))))
+    `(:applied ,applied
+      :not-loaded ,not-loaded
+      :synced ,(or (java-server--sync-hcr-target-classes-to-tomcat details targets) 0))))
+
+(defun java-server--dape-pause-all (conn)
+  "Pause all threads in CONN."
+  (dape-request
+   ;; java-debug interprets threadId 0 as a whole-VM pause.
+   conn :pause '(:threadId 0)
+   (lambda (_body error)
+     (when error
+       (message "HCR queued, but pause failed: %s" error)))))
+
+(defun java-server--dape-continue-all (conn)
+  "Resume all threads in CONN."
+  (dape-request
+   ;; java-debug interprets threadId 0 as a whole-VM resume.
+   conn :continue '(:threadId 0)
+   (lambda (body error)
+     (if error
+         (message "HCR applied; auto-resume failed: %s" error)
+       ;; Dape expects a synthetic continued event here, same as `dape-continue'.
+       (dape-handle-event
+        conn 'continued
+        `(:threadId 0
+          :allThreadsContinued
+          ,(if (plist-member body :allThreadsContinued)
+               (eq (plist-get body :allThreadsContinued) t)
+             t)))))))
+
+(defun java-server--queue-hot-replace (conn)
+  "Queue HCR for CONN and pause execution if needed."
+  (if java-server--pending-hot-replace
+      (message "HCR already queued; waiting for debugger to stop.")
+    (setq java-server--pending-hot-replace t
+          java-server--hcr-auto-resume t)
+    (message "HCR queued; pausing all debug threads...")
+    (java-server--dape-pause-all conn)))
+
+(defun java-server--request-hot-replace (conn &optional interactive)
+  "Send a hot code replace request on CONN.
+When INTERACTIVE is non-nil, keep user-facing messages explicit."
+  (let ((targets java-server--pending-hcr-target-classes)
+        (details java-server--pending-hcr-project-details))
+    (cond
+     (java-server--hcr-in-progress
+      (if interactive
+          (user-error "Hot code replace already in progress")
+        (message "HCR already in progress.")))
+     ((java-server--direct-hot-replace-available-p details targets)
+      (setq java-server--pending-hot-replace nil
+            java-server--hcr-in-progress t)
+      (message "Running direct HCR...")
+      (unwind-protect
+          (let* ((result (java-server--direct-hot-replace details targets))
+                 (applied (plist-get result :applied))
+                 (not-loaded (plist-get result :not-loaded))
+                 (synced (plist-get result :synced)))
+            (message
+             "HCR applied %d loaded classes via Attach API%s%s"
+             applied
+             (if (> not-loaded 0)
+                 (format "; %d classes were not yet loaded" not-loaded)
+               "")
+             (if (> synced 0)
+                 (format ". Synced %d class files to Tomcat webapp." synced)
+               ".")))
+        (setq java-server--hcr-in-progress nil
+              java-server--pending-hcr-target-classes nil
+              java-server--pending-hcr-project-details nil
+              java-server--hcr-auto-resume nil)))
+     ((not (java-server--dape-stopped-p conn))
+      (java-server--queue-hot-replace conn))
+     (t
+      (setq java-server--pending-hot-replace nil)
+      (setq java-server--hcr-in-progress t)
+      (message "Running HCR...")
+      (let ((dape-request-timeout 30))
+        (dape-request
+         conn :redefineClasses nil
+         (lambda (body error)
+           (let* ((changed-classes (or (plist-get body :changedClasses) []))
+                  (targets java-server--pending-hcr-target-classes)
+                  (details java-server--pending-hcr-project-details)
+                  (synced-count
+                   (and (not error)
+                        (not (plist-get body :errorMessage))
+                        (java-server--sync-hcr-target-classes-to-tomcat details targets))))
+             (setq java-server--hcr-in-progress nil)
+             (cond
+              (error
+               (message "HCR request failed: %s" error))
+              ((plist-get body :errorMessage)
+               (message "HCR failed: %s" (plist-get body :errorMessage)))
+              (t
+               (message "%s%s"
+                        (java-server--hcr-result-message changed-classes)
+                        (if (and synced-count (> synced-count 0))
+                            (format " Synced %d class files to Tomcat webapp."
+                                    synced-count)
+                          ""))))
+             (setq java-server--pending-hcr-target-classes nil
+                   java-server--pending-hcr-project-details nil))
+           (when (and java-server--hcr-auto-resume
+                      (java-server--dape-stopped-p conn))
+             (setq java-server--hcr-auto-resume nil)
+             (java-server--dape-continue-all conn))
+           (unless (java-server--dape-stopped-p conn)
+             (setq java-server--hcr-auto-resume nil)))))))))
+
+;;;###autoload
+(defun java-server-hot-replace ()
+  "Trigger hot code replace on the active debug session.
+Requires dape connected via JPDA to a java-debug adapter."
+  (interactive)
+  (if-let* ((conn (java-server--active-dape-connection)))
+      (java-server--request-hot-replace conn 'interactive)
+    (user-error "No active Java debug session")))
 
 (defun java-server--register-dape-configs ()
   "Register java-server dape configurations."
@@ -730,18 +1446,56 @@ Otherwise report that manual setup is needed."
     (add-to-list 'dape-configs
                  `(java-server-tomcat
                    modes (java-mode java-ts-mode)
-                   :request "attach"
-                   :hostname "localhost"
-                   :port ,java-server-tomcat-debug-port))
+                   ensure java-server--ensure-dape-attach-prerequisites
+                   fn java-server--dape-resolve-attach-config
+                   jpda-port ,java-server-tomcat-debug-port))
     (add-to-list 'dape-configs
                  `(java-server-spring-boot
                    modes (java-mode java-ts-mode)
-                   :request "attach"
-                   :hostname "localhost"
-                   :port ,java-server-spring-boot-debug-port))))
+                   ensure java-server--ensure-dape-attach-prerequisites
+                   fn java-server--dape-resolve-attach-config
+                   jpda-port ,java-server-spring-boot-debug-port))))
 
 (with-eval-after-load 'dape
-  (java-server--register-dape-configs))
+  (java-server--register-dape-configs)
+  (add-hook 'after-save-hook #'java-server--track-saved-java-class)
+  (cl-defmethod dape-handle-event :after (conn (_event (eql initialized)) _body)
+    "Track the project associated with the active java-server debug session."
+    (when-let* ((details (plist-get (dape--config conn) 'project-details)))
+      (setq java-server--active-debug-project-details details)))
+  (cl-defmethod dape-handle-event :after (conn (_event (eql stopped)) _body)
+    "Run pending HCR after the debugger stops."
+    (when (and java-server--pending-hot-replace
+               (not java-server--hcr-in-progress))
+      (java-server--request-hot-replace conn)))
+  (cl-defmethod dape-handle-event :after (_conn (_event (eql terminated)) _body)
+    "Clear java-server HCR state when the debug session terminates."
+    (setq java-server--hcr-in-progress nil
+          java-server--pending-hot-replace nil
+          java-server--active-debug-project-details nil
+          java-server--pending-hcr-project-details nil
+          java-server--pending-hcr-target-classes nil
+          java-server--hcr-auto-resume nil))
+  (cl-defmethod dape-handle-event :after (_conn (_event (eql exited)) _body)
+    "Clear java-server HCR state when the debuggee exits."
+    (setq java-server--hcr-in-progress nil
+          java-server--pending-hot-replace nil
+          java-server--active-debug-project-details nil
+          java-server--pending-hcr-project-details nil
+          java-server--pending-hcr-target-classes nil
+          java-server--hcr-auto-resume nil))
+  (cl-defmethod dape-handle-event (conn (_event (eql hotcodereplace)) body)
+    "Handle hot code replace events from java-debug adapter."
+    (let ((change-type (plist-get body :changeType))
+          (message-text (plist-get body :message)))
+      (pcase change-type
+        ("ERROR"         (message "HCR failed: %s" (or message-text "unknown error")))
+        ("WARNING"       (message "HCR warning: %s" (or message-text "")))
+        ("BUILD_COMPLETE"
+         (if (eq java-server-hot-code-replace-mode 'auto)
+             (java-server--request-hot-replace conn)
+           (message "HCR: class files updated.")))
+        (_ nil)))))
 
 ;;; ============================================================
 ;;; Module 7: Minor mode
