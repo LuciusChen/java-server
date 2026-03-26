@@ -10,8 +10,6 @@ Single-file Emacs helpers for local Java server work.
 - build and run Spring Boot applications
 - attach `dape` through JDTLS/java-debug
 - trigger hot code replace for local debug sessions
-- jump between MyBatis mapper interfaces and XML files
-- decompile `.class` files with FernFlower
 
 ## Requirements
 
@@ -23,7 +21,6 @@ Single-file Emacs helpers for local Java server work.
 - optional:
   - `dape`
   - `eglot`
-  - `fernflower`
 
 For Java debug attach, JDTLS must already be running with the `java-debug` plugin loaded.
 
@@ -42,9 +39,7 @@ Load `java-server.el` from your Emacs configuration.
    java-server-spring-boot-stop
    java-server-select-jdk
    java-server-auto-select-jdk
-   java-server-hot-replace
-   java-server-mapper-find-xml
-   java-server-decompile-class))
+   java-server-hot-replace))
 ```
 
 ## Main Commands
@@ -56,8 +51,6 @@ Load `java-server.el` from your Emacs configuration.
 - `M-x java-server-spring-boot-run`
 - `M-x java-server-spring-boot-stop`
 - `M-x java-server-hot-replace`
-- `M-x java-server-mapper-find-xml`
-- `M-x java-server-decompile-class`
 
 ## Debug Attach
 
