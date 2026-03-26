@@ -5,26 +5,24 @@ with JDK auto-detection and optional dape integration.  Does NOT include general
 Java editing utilities (MyBatis navigation, decompilation) — those belong in
 personal config or a separate package.
 
-## Shared Guidelines
-
-Also follow:
-- `~/repos/coding-guidelines/general.md`
-- `~/repos/coding-guidelines/elisp.md`
-
-Keep this file focused on package-specific constraints that are not already covered there.
+This guide is self-contained. Do not rely on machine-specific paths or external
+documents to explain the rules for this repository.
 
 ## First Principles
 
 - **Question every abstraction**: Before adding a layer or indirection, ask "is this solving a real problem right now?" If the answer is hypothetical, don't add it.
 - **Simplify relentlessly**: Three similar lines of code are better than a premature abstraction. This is a single-file package — keep it that way unless a genuinely distinct responsibility emerges.
+- **Prefer boring code**: Reach for direct conditionals and obvious state transitions before clever dispatch or generic frameworks.
 - **Delete, don't deprecate**: If something is unused, remove it entirely. No backward-compatibility shims, no re-exports, no "removed" comments.
 
 ## Diagnosis and Testing
 
 - **Find the root cause before changing behavior**: Do not stack timing or fallback patches without naming the failing layer.
+- **Fix the right layer**: Solve the problem where it originates instead of compensating in callers or unrelated hooks.
 - **After two failed fixes, stop patching and switch to diagnosis**: Gather logs, adapter events, or runtime evidence before changing behavior again.
 - **Prefer failing regression tests for bug fixes**: When practical, add the test before the fix and make sure it proves the bug.
 - **Errors must surface clearly**: Catch only at the outer boundary where the package can turn failures into user-facing messages.
+- **Keep experiments narrow**: Start with the smallest change that proves the approach before expanding scope.
 
 ## Architecture
 
@@ -56,6 +54,7 @@ Keep this file focused on package-specific constraints that are not already cove
 - **`user-error`** for user-caused problems (no project root, no Tomcat home, no JAR found). Does NOT trigger `debug-on-error`.
 - **`error`** for programmer bugs only.
 - **`condition-case`** to handle recoverable errors. Wrap non-essential operations (desktop notifications, port checks) so errors never block primary results.
+- Do not hide failures behind fallback return values. Unexpected failures should stop the flow immediately.
 - Error messages should state what is wrong, not what should be (e.g., "No Tomcat process found" not "Tomcat must be running").
 
 ## State Management
@@ -102,6 +101,12 @@ emacs -Q --batch --eval '(load "java-server.el")'
 ```
 
 Must produce no errors and no side effects.
+
+### 4. Run the test file
+
+```bash
+emacs -Q --batch -l test/java-server-test.el -f ert-run-tests-batch-and-exit
+```
 
 ## Quality Checks
 
