@@ -28,7 +28,6 @@
 (declare-function eglot--managed-buffers "eglot")
 (declare-function eglot--project "eglot")
 (declare-function dape "dape")
-(declare-function dape--config "dape")
 (declare-function dape-continue "dape")
 (declare-function dape-handle-event "dape")
 (declare-function dape-pause "dape")
@@ -792,8 +791,7 @@ DETAILS is the project plist used to find the matching server."
   (let ((path (file-name-as-directory (file-truename path)))
         (project-home (file-name-as-directory (file-truename project-home))))
     (or (string= path project-home)
-        (file-in-directory-p path project-home)
-        (file-in-directory-p project-home path))))
+        (file-in-directory-p path project-home))))
 
 (defun java-server--project-eglot-buffer (project-home)
   "Return a buffer under PROJECT-HOME with an active JDTLS server."
@@ -868,6 +866,9 @@ Return the adapter port."
                        (error-message-string err)))))
     (user-error "No active JDTLS server found for %s" (plist-get details :home))))
 
+(defvar java-server--active-debug-project-details nil
+  "Project details plist for the current java-server-managed dape session.")
+
 (defun java-server--dape-resolve-attach-config (config &optional details)
   "Resolve dape CONFIG for a Java JPDA attach session.
 DETAILS is the project plist used to find the matching JDTLS server."
@@ -888,6 +889,7 @@ DETAILS is the project plist used to find the matching JDTLS server."
     (setq config (plist-put config :port jpda-port))
     (setq config (plist-put config :projectName
                             (or (plist-get config :projectName) project-name)))
+    (setq java-server--active-debug-project-details details)
     (setq config (plist-put config 'project-details details))
     (setq config (plist-put config :sourcePaths
                             (or (plist-get config :sourcePaths)
@@ -926,9 +928,6 @@ DETAILS is the project plist used to find the matching JDTLS server."
 
 (defvar java-server--hcr-auto-resume nil
   "Non-nil when java-server should resume after an auto-paused HCR.")
-
-(defvar java-server--active-debug-project-details nil
-  "Project details plist for the current java-server-managed dape session.")
 
 (defun java-server--same-project-home-p (left right)
   "Return non-nil when LEFT and RIGHT denote the same project root."
@@ -1467,6 +1466,15 @@ Requires dape connected via JPDA to a java-debug adapter."
       (java-server--request-hot-replace conn 'interactive)
     (user-error "No active Java debug session")))
 
+(defun java-server--clear-hcr-state ()
+  "Reset all HCR-related state variables."
+  (setq java-server--hcr-in-progress nil
+        java-server--pending-hot-replace nil
+        java-server--active-debug-project-details nil
+        java-server--pending-hcr-project-details nil
+        java-server--pending-hcr-target-classes nil
+        java-server--hcr-auto-resume nil))
+
 (defun java-server--register-dape-configs ()
   "Register java-server dape configurations."
   (when (boundp 'dape-configs)
@@ -1486,10 +1494,6 @@ Requires dape connected via JPDA to a java-debug adapter."
 (with-eval-after-load 'dape
   (java-server--register-dape-configs)
   (add-hook 'after-save-hook #'java-server--track-saved-java-class)
-  (cl-defmethod dape-handle-event :after (conn (_event (eql initialized)) _body)
-    "Track the project associated with the active java-server debug session."
-    (when-let* ((details (plist-get (dape--config conn) 'project-details)))
-      (setq java-server--active-debug-project-details details)))
   (cl-defmethod dape-handle-event :after (conn (_event (eql stopped)) _body)
     "Run pending HCR after the debugger stops."
     (when (and java-server--pending-hot-replace
@@ -1497,20 +1501,10 @@ Requires dape connected via JPDA to a java-debug adapter."
       (java-server--request-hot-replace conn)))
   (cl-defmethod dape-handle-event :after (_conn (_event (eql terminated)) _body)
     "Clear java-server HCR state when the debug session terminates."
-    (setq java-server--hcr-in-progress nil
-          java-server--pending-hot-replace nil
-          java-server--active-debug-project-details nil
-          java-server--pending-hcr-project-details nil
-          java-server--pending-hcr-target-classes nil
-          java-server--hcr-auto-resume nil))
+    (java-server--clear-hcr-state))
   (cl-defmethod dape-handle-event :after (_conn (_event (eql exited)) _body)
     "Clear java-server HCR state when the debuggee exits."
-    (setq java-server--hcr-in-progress nil
-          java-server--pending-hot-replace nil
-          java-server--active-debug-project-details nil
-          java-server--pending-hcr-project-details nil
-          java-server--pending-hcr-target-classes nil
-          java-server--hcr-auto-resume nil))
+    (java-server--clear-hcr-state))
   (cl-defmethod dape-handle-event (conn (_event (eql hotcodereplace)) body)
     "Handle hot code replace events from java-debug adapter."
     (let ((change-type (plist-get body :changeType))
